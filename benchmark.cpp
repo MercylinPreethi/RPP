@@ -122,7 +122,6 @@ RppStatus crop_u8_u8_host(Rpp8u *srcPtr, RpptDescPtr srcDescPtr, Rpp8u *dstPtr, 
     srcPtrChannel = srcPtrImage + (roi.xywhROI.xy.y * srcDescPtr->strides.hStride) + (roi.xywhROI.xy.x * layoutParams.bufferMultiplier);
     dstPtrChannel = dstPtrImage;
 
-    // Crop without layout toggle (NHWC->NHWC or NCHW->NCHW)
     for(int c = 0; c < layoutParams.channelParam; c++)
     {
         Rpp8u *srcPtrRow, *dstPtrRow;
@@ -143,7 +142,6 @@ RppStatus crop_u8_u8_host(Rpp8u *srcPtr, RpptDescPtr srcDescPtr, Rpp8u *dstPtr, 
     return RPP_SUCCESS;
 }
 
-
 vector<Mat> loadBatchImages(const string& directory, int& batchSize, int& maxWidth, int& maxHeight, bool isColor)
 {
     vector<Mat> images;
@@ -160,7 +158,6 @@ vector<Mat> loadBatchImages(const string& directory, int& batchSize, int& maxWid
 
     while ((entry = readdir(dir)) != NULL) {
         string filename = entry->d_name;
-
         if (filename == "." || filename == "..") continue;
 
         string ext = filename.substr(filename.find_last_of(".") + 1);
@@ -175,8 +172,6 @@ vector<Mat> loadBatchImages(const string& directory, int& batchSize, int& maxWid
             maxWidth = max(maxWidth, img.cols);
             maxHeight = max(maxHeight, img.rows);
             images.push_back(move(img));
-        } else {
-            cerr << "Warning: Could not read image " << filePath << endl;
         }
     }
 
@@ -212,280 +207,446 @@ void convert_nhwc_to_nchw(const vector<Mat>& nhwc_imgs, vector<vector<Rpp8u>>& n
     }
 }
 
-void benchmarkOpenCV_Crop(const vector<Mat>& imgs, int cropW, int cropH)
+void convert_to_grayscale(const vector<Mat>& rgb_imgs, vector<Mat>& gray_imgs)
+{
+    gray_imgs.resize(rgb_imgs.size());
+    for (size_t i = 0; i < rgb_imgs.size(); i++) {
+        cvtColor(rgb_imgs[i], gray_imgs[i], COLOR_BGR2GRAY);
+    }
+}
+
+
+void benchmarkOpenCV_Crop_RGB(const vector<Mat>& imgs, int cropW, int cropH)
 {
     int batchSize = imgs.size();
-    if (batchSize == 0) {
-        cerr << "Error: No images to process!" << endl;
-        return;
-    }
+    if (batchSize == 0) return;
 
-    // Filter images that are large enough
-    vector<int> validIndices;
+    // Count valid images
+    int validCount = 0;
     for (int i = 0; i < batchSize; i++) {
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
-            validIndices.push_back(i);
+            validCount++;
         }
     }
     
-    if (validIndices.empty()) {
-        cerr << "Error: No images large enough for " << cropW << "x" << cropH << " crop!" << endl;
+    if (validCount == 0) {
+        cout << "OpenCV RGB (3-ch)    : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
         return;
     }
 
-    vector<Mat> output(validIndices.size());
+    vector<Mat> output(batchSize);
+    vector<Rect> rois(batchSize);
+    vector<bool> isValid(batchSize);
     
-    // Define crop ROI (center crop)
-    vector<Rect> rois(validIndices.size());
-    for (size_t idx = 0; idx < validIndices.size(); idx++) {
-        int i = validIndices[idx];
-        int x = (imgs[i].cols - cropW) / 2;
-        int y = (imgs[i].rows - cropH) / 2;
-        rois[idx] = Rect(x, y, cropW, cropH);
-    }
-
     auto start = high_resolution_clock::now();
 
-    // Run benchmark
+    for (int i = 0; i < batchSize; i++) {
+        if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
+            int x = (imgs[i].cols - cropW) / 2;
+            int y = (imgs[i].rows - cropH) / 2;
+            rois[i] = Rect(x, y, cropW, cropH);
+            isValid[i] = true;
+        } else {
+            isValid[i] = false;
+        }
+    }
+
     for (int k = 0; k < NUM_ITERATIONS; k++) {
-        for (size_t idx = 0; idx < validIndices.size(); idx++) {
-            int i = validIndices[idx];
-            output[idx] = imgs[i](rois[idx]).clone();
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                output[i] = imgs[i](rois[i]).clone();
+            }
         }
     }
 
     auto end = high_resolution_clock::now();
 
-    double avg_time = duration_cast<microseconds>(end - start).count() / (NUM_ITERATIONS * 1000.0);
-    double fps = (NUM_ITERATIONS * validIndices.size() * 1000.0) / duration_cast<milliseconds>(end - start).count();
+    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+    double avg_time = total_time_ms / NUM_ITERATIONS;
     
-    cout << "OpenCV Crop          : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
-         << setw(8) << setprecision(1) << fps << " FPS (" << validIndices.size() << " imgs)" << endl;
+    cout << "OpenCV RGB (3-ch)    : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+         << setw(8) << setprecision(1) << endl;
+}
+
+void benchmarkOpenCV_Crop_Grayscale(const vector<Mat>& gray_imgs, int cropW, int cropH)
+{
+    int batchSize = gray_imgs.size();
+    if (batchSize == 0) return;
+
+
+    int validCount = 0;
+    for (int i = 0; i < batchSize; i++) {
+        if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
+            validCount++;
+        }
+    }
+    
+    if (validCount == 0) {
+        cout << "OpenCV Gray (1-ch)   : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
+        return;
+    }
+
+    vector<Mat> output(batchSize);
+    vector<Rect> rois(batchSize);
+    vector<bool> isValid(batchSize);
+
+    auto start = high_resolution_clock::now();
+    
+    for (int i = 0; i < batchSize; i++) {
+        if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
+            int x = (gray_imgs[i].cols - cropW) / 2;
+            int y = (gray_imgs[i].rows - cropH) / 2;
+            rois[i] = Rect(x, y, cropW, cropH);
+            isValid[i] = true;
+        } else {
+            isValid[i] = false;
+        }
+    }
+
+    for (int k = 0; k < NUM_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                output[i] = gray_imgs[i](rois[i]).clone();
+            }
+        }
+    }
+
+    auto end = high_resolution_clock::now();
+
+    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+    double avg_time = total_time_ms / NUM_ITERATIONS;
+    
+    cout << "OpenCV Gray (1-ch)   : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+         << setw(8) << setprecision(1) << endl;
 }
 
 void benchmarkRPP_Crop_NHWC(const vector<Mat>& imgs, int cropW, int cropH)
 {
     int batchSize = imgs.size();
-    if (batchSize == 0) {
-        cerr << "Error: No images to process!" << endl;
-        return;
-    }
+    if (batchSize == 0) return;
 
-    // Filter images that are large enough
-    vector<int> validIndices;
+    int validCount = 0;
     for (int i = 0; i < batchSize; i++) {
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
-            validIndices.push_back(i);
+            validCount++;
         }
     }
     
-    if (validIndices.empty()) {
-        cerr << "Error: No images large enough for " << cropW << "x" << cropH << " crop!" << endl;
+    if (validCount == 0) {
+        cout << "RPP NHWC (3-ch)      : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
         return;
     }
 
     int channels = 3;
     
-    // Allocate output images
-    vector<vector<Rpp8u>> output(validIndices.size());
-    for (size_t idx = 0; idx < validIndices.size(); idx++)
-        output[idx].resize(cropW * cropH * channels);
 
-    // Initialize descriptors and ROIs
-    vector<RpptDesc> srcDescs(validIndices.size()), dstDescs(validIndices.size());
-    vector<RpptROI> rois(validIndices.size());
+    vector<vector<Rpp8u>> output(batchSize);
+    for (int i = 0; i < batchSize; i++)
+        output[i].resize(cropW * cropH * channels);
+
+    vector<RpptDesc> srcDescs(batchSize), dstDescs(batchSize);
+    vector<RpptROI> rois(batchSize);
+    vector<bool> isValid(batchSize);
     
-    for (size_t idx = 0; idx < validIndices.size(); idx++) {
-        int i = validIndices[idx];
-        const Mat& img = imgs[i];
-        
-        // Set ROI (center crop)
-        rois[idx].xywhROI.xy.x = (img.cols - cropW) / 2;
-        rois[idx].xywhROI.xy.y = (img.rows - cropH) / 2;
-        rois[idx].xywhROI.roiWidth = cropW;
-        rois[idx].xywhROI.roiHeight = cropH;
-        
-        // Source descriptor (NHWC)
-        srcDescs[idx].h = img.rows;
-        srcDescs[idx].w = img.cols;
-        srcDescs[idx].c = channels;
-        srcDescs[idx].layout = RpptLayout::NHWC;
-        srcDescs[idx].strides.hStride = img.cols * channels;
-        srcDescs[idx].strides.wStride = channels;
-        srcDescs[idx].strides.cStride = 1;
-        
-        // Destination descriptor (NHWC)
-        dstDescs[idx].h = cropH;
-        dstDescs[idx].w = cropW;
-        dstDescs[idx].c = channels;
-        dstDescs[idx].layout = RpptLayout::NHWC;
-        dstDescs[idx].strides.hStride = cropW * channels;
-        dstDescs[idx].strides.wStride = channels;
-        dstDescs[idx].strides.cStride = 1;
-    }
-
-    RppLayoutParams layoutParams = {(Rpp32u)channels, (Rpp32u)channels};
-
     auto start = high_resolution_clock::now();
 
-    // Run benchmark
+    for (int i = 0; i < batchSize; i++) {
+        if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
+            const Mat& img = imgs[i];
+            
+            rois[i].xywhROI.xy.x = (img.cols - cropW) / 2;
+            rois[i].xywhROI.xy.y = (img.rows - cropH) / 2;
+            rois[i].xywhROI.roiWidth = cropW;
+            rois[i].xywhROI.roiHeight = cropH;
+            
+            srcDescs[i].h = img.rows;
+            srcDescs[i].w = img.cols;
+            srcDescs[i].c = channels;
+            srcDescs[i].layout = RpptLayout::NHWC;
+            srcDescs[i].strides.hStride = img.cols * channels;
+            srcDescs[i].strides.wStride = channels;
+            srcDescs[i].strides.cStride = 1;
+            
+            dstDescs[i].h = cropH;
+            dstDescs[i].w = cropW;
+            dstDescs[i].c = channels;
+            dstDescs[i].layout = RpptLayout::NHWC;
+            dstDescs[i].strides.hStride = cropW * channels;
+            dstDescs[i].strides.wStride = channels;
+            dstDescs[i].strides.cStride = 1;
+            
+            isValid[i] = true;
+        } else {
+            isValid[i] = false;
+        }
+    }
+
+    RppLayoutParams layoutParams = {3, 1};
+
     for (int k = 0; k < NUM_ITERATIONS; k++) {
-        for (size_t idx = 0; idx < validIndices.size(); idx++) {
-            int i = validIndices[idx];
-            crop_u8_u8_host(imgs[i].data, &srcDescs[idx], output[idx].data(), &dstDescs[idx],
-                           &rois[idx], RpptRoiType::XYWH, layoutParams);
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                crop_u8_u8_host(imgs[i].data, &srcDescs[i], output[i].data(), &dstDescs[i],
+                               &rois[i], RpptRoiType::XYWH, layoutParams);
+            }
         }
     }
 
     auto end = high_resolution_clock::now();
 
-    double avg_time = duration_cast<microseconds>(end - start).count() / (NUM_ITERATIONS * 1000.0);
-    double fps = (NUM_ITERATIONS * validIndices.size() * 1000.0) / duration_cast<milliseconds>(end - start).count();
+    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+    double avg_time = total_time_ms / NUM_ITERATIONS;
     
-    cout << "RPP Crop NHWC->NHWC  : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
-         << setw(8) << setprecision(1) << fps << " FPS (" << validIndices.size() << " imgs)" << endl;
+    cout << "RPP NHWC (3-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+         << setw(8) << setprecision(1) << endl;
 }
 
 void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector<Mat>& imgs, int cropW, int cropH)
 {
     int batchSize = imgs.size();
-    if (batchSize == 0) {
-        cerr << "Error: No images to process!" << endl;
-        return;
-    }
+    if (batchSize == 0) return;
 
-    // Filter images that are large enough
-    vector<int> validIndices;
+    int validCount = 0;
     for (int i = 0; i < batchSize; i++) {
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
-            validIndices.push_back(i);
+            validCount++;
         }
     }
     
-    if (validIndices.empty()) {
-        cerr << "Error: No images large enough for " << cropW << "x" << cropH << " crop!" << endl;
+    if (validCount == 0) {
+        cout << "RPP NCHW (1-ch×3)    : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
         return;
     }
 
     int channels = 3;
     
-    // Allocate output images
-    vector<vector<Rpp8u>> output(validIndices.size());
-    for (size_t idx = 0; idx < validIndices.size(); idx++)
-        output[idx].resize(cropW * cropH * channels);
-
-    // Initialize descriptors and ROIs
-    vector<RpptDesc> srcDescs(validIndices.size()), dstDescs(validIndices.size());
-    vector<RpptROI> rois(validIndices.size());
     
-    for (size_t idx = 0; idx < validIndices.size(); idx++) {
-        int i = validIndices[idx];
-        const Mat& img = imgs[i];
-        
-        // Set ROI (center crop)
-        rois[idx].xywhROI.xy.x = (img.cols - cropW) / 2;
-        rois[idx].xywhROI.xy.y = (img.rows - cropH) / 2;
-        rois[idx].xywhROI.roiWidth = cropW;
-        rois[idx].xywhROI.roiHeight = cropH;
-        
-        // Source descriptor (NCHW)
-        srcDescs[idx].h = img.rows;
-        srcDescs[idx].w = img.cols;
-        srcDescs[idx].c = channels;
-        srcDescs[idx].layout = RpptLayout::NCHW;
-        srcDescs[idx].strides.hStride = img.cols;
-        srcDescs[idx].strides.wStride = 1;
-        srcDescs[idx].strides.cStride = img.cols * img.rows;
-        
-        // Destination descriptor (NCHW)
-        dstDescs[idx].h = cropH;
-        dstDescs[idx].w = cropW;
-        dstDescs[idx].c = channels;
-        dstDescs[idx].layout = RpptLayout::NCHW;
-        dstDescs[idx].strides.hStride = cropW;
-        dstDescs[idx].strides.wStride = 1;
-        dstDescs[idx].strides.cStride = cropW * cropH;
-    }
+    vector<vector<Rpp8u>> output(batchSize);
+    for (int i = 0; i < batchSize; i++)
+        output[i].resize(cropW * cropH * channels);
 
-    RppLayoutParams layoutParams = {1, (Rpp32u)channels};
+    vector<RpptDesc> srcDescs(batchSize), dstDescs(batchSize);
+    vector<RpptROI> rois(batchSize);
+    vector<bool> isValid(batchSize);
 
     auto start = high_resolution_clock::now();
+    
+    for (int i = 0; i < batchSize; i++) {
+        if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
+            const Mat& img = imgs[i];
+            
+            rois[i].xywhROI.xy.x = (img.cols - cropW) / 2;
+            rois[i].xywhROI.xy.y = (img.rows - cropH) / 2;
+            rois[i].xywhROI.roiWidth = cropW;
+            rois[i].xywhROI.roiHeight = cropH;
+            
+            srcDescs[i].h = img.rows;
+            srcDescs[i].w = img.cols;
+            srcDescs[i].c = channels;
+            srcDescs[i].layout = RpptLayout::NCHW;
+            srcDescs[i].strides.hStride = img.cols;
+            srcDescs[i].strides.wStride = 1;
+            srcDescs[i].strides.cStride = img.cols * img.rows;
+            
+            dstDescs[i].h = cropH;
+            dstDescs[i].w = cropW;
+            dstDescs[i].c = channels;
+            dstDescs[i].layout = RpptLayout::NCHW;
+            dstDescs[i].strides.hStride = cropW;
+            dstDescs[i].strides.wStride = 1;
+            dstDescs[i].strides.cStride = cropW * cropH;
+            
+            isValid[i] = true;
+        } else {
+            isValid[i] = false;
+        }
+    }
 
-    // Run benchmark
+    RppLayoutParams layoutParams = {1, 1};
+
+
     for (int k = 0; k < NUM_ITERATIONS; k++) {
-        for (size_t idx = 0; idx < validIndices.size(); idx++) {
-            int i = validIndices[idx];
-            crop_u8_u8_host((Rpp8u*)nchw_imgs[i].data(), &srcDescs[idx], output[idx].data(), &dstDescs[idx],
-                           &rois[idx], RpptRoiType::XYWH, layoutParams);
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                for (int c = 0; c < channels; c++) {
+                    Rpp8u* srcChannel = (Rpp8u*)nchw_imgs[i].data() + c * srcDescs[i].strides.cStride;
+                    Rpp8u* dstChannel = output[i].data() + c * dstDescs[i].strides.cStride;
+                    
+                    crop_u8_u8_host(srcChannel, &srcDescs[i], dstChannel, &dstDescs[i],
+                                   &rois[i], RpptRoiType::XYWH, layoutParams);
+                }
+            }
         }
     }
 
     auto end = high_resolution_clock::now();
 
-    double avg_time = duration_cast<microseconds>(end - start).count() / (NUM_ITERATIONS * 1000.0);
-    double fps = (NUM_ITERATIONS * validIndices.size() * 1000.0) / duration_cast<milliseconds>(end - start).count();
+    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+    double avg_time = total_time_ms / NUM_ITERATIONS;
     
-    cout << "RPP Crop NCHW->NCHW  : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
-         << setw(8) << setprecision(1) << fps << " FPS (" << validIndices.size() << " imgs)" << endl;
+    cout << "RPP NCHW (1-ch×3)    : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+         << setw(8) << setprecision(1) << endl;
 }
 
+void benchmarkRPP_Crop_Grayscale(const vector<vector<Rpp8u>>& gray_nchw_imgs, 
+                                  const vector<Mat>& gray_imgs, 
+                                  int cropW, int cropH)
+{
+    int batchSize = gray_imgs.size();
+    if (batchSize == 0) return;
+
+    int validCount = 0;
+    for (int i = 0; i < batchSize; i++) {
+        if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
+            validCount++;
+        }
+    }
+    
+    if (validCount == 0) {
+        cout << "RPP Gray (1-ch)      : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
+        return;
+    }
+
+    int channels = 1;
+
+
+    vector<vector<Rpp8u>> output(batchSize);
+    for (int i = 0; i < batchSize; i++)
+        output[i].resize(cropW * cropH * channels);
+
+    vector<RpptDesc> srcDescs(batchSize), dstDescs(batchSize);
+    vector<RpptROI> rois(batchSize);
+    vector<bool> isValid(batchSize);
+
+    auto start = high_resolution_clock::now();
+    
+    for (int i = 0; i < batchSize; i++) {
+        if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
+            const Mat& img = gray_imgs[i];
+            
+            rois[i].xywhROI.xy.x = (img.cols - cropW) / 2;
+            rois[i].xywhROI.xy.y = (img.rows - cropH) / 2;
+            rois[i].xywhROI.roiWidth = cropW;
+            rois[i].xywhROI.roiHeight = cropH;
+            
+            srcDescs[i].h = img.rows;
+            srcDescs[i].w = img.cols;
+            srcDescs[i].c = channels;
+            srcDescs[i].layout = RpptLayout::NCHW;
+            srcDescs[i].strides.hStride = img.cols;
+            srcDescs[i].strides.wStride = 1;
+            srcDescs[i].strides.cStride = img.cols * img.rows;
+            
+            dstDescs[i].h = cropH;
+            dstDescs[i].w = cropW;
+            dstDescs[i].c = channels;
+            dstDescs[i].layout = RpptLayout::NCHW;
+            dstDescs[i].strides.hStride = cropW;
+            dstDescs[i].strides.wStride = 1;
+            dstDescs[i].strides.cStride = cropW * cropH;
+            
+            isValid[i] = true;
+        } else {
+            isValid[i] = false;
+        }
+    }
+
+    RppLayoutParams layoutParams = {1, 1};
+
+    for (int k = 0; k < NUM_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                crop_u8_u8_host((Rpp8u*)gray_nchw_imgs[i].data(), &srcDescs[i], 
+                               output[i].data(), &dstDescs[i],
+                               &rois[i], RpptRoiType::XYWH, layoutParams);
+            }
+        }
+    }
+
+    auto end = high_resolution_clock::now();
+
+    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+    double avg_time = total_time_ms / NUM_ITERATIONS;
+    
+    cout << "RPP Gray (1-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+         << setw(8) << setprecision(1) << endl;
+}
 
 
 int main(int argc, char** argv) {
     string imageDir = (argc > 1) ? argv[1] : ".";
     
     cout << "\n===============================================================" << endl;
-    cout << "  Crop Performance Benchmark: OpenCV vs RPP (Embedded)" << endl;
-    cout << "  No RPP Library Required - Standalone Code!" << endl;
+    cout << "  Crop Performance Benchmark: OpenCV vs RPP" << endl;
+    cout << "  Size-Safe Benchmarking (skips images that are too small)" << endl;
     cout << "===============================================================\n" << endl;
 
-    // Load images
     int batchSize = 0, maxWidth = 0, maxHeight = 0;
-    cout << "Loading images from: " << imageDir << endl;
-    vector<Mat> imgs = loadBatchImages(imageDir, batchSize, maxWidth, maxHeight, true);
+    cout << "Loading RGB images from: " << imageDir << endl;
+    vector<Mat> imgs_rgb = loadBatchImages(imageDir, batchSize, maxWidth, maxHeight, true);
 
-    if (imgs.empty()) {
-        cerr << "Error: No images found in directory!" << endl;
+    if (imgs_rgb.empty()) {
+        cerr << "Error: No images found!" << endl;
         return -1;
     }
 
-    cout << "Loaded " << batchSize << " images" << endl;
+    cout << "Loaded " << batchSize << " RGB images" << endl;
     cout << "Max dimensions: " << maxWidth << "x" << maxHeight << endl;
-    cout << "Channels: " << imgs[0].channels() << endl;
     cout << "Iterations: " << NUM_ITERATIONS << "\n" << endl;
 
-    // Convert to NCHW format
-    cout << "Converting images to NCHW format..." << endl;
-    vector<vector<Rpp8u>> nchw_imgs;
-    convert_nhwc_to_nchw(imgs, nchw_imgs);
-    cout << "Conversion complete\n" << endl;
+    cout << "Converting to Grayscale..." << endl;
+    vector<Mat> imgs_gray;
+    convert_to_grayscale(imgs_rgb, imgs_gray);
+    cout << "Grayscale conversion complete\n" << endl;
 
-    // Define crop sizes to test
+    cout << "Converting RGB to NCHW format..." << endl;
+
+    vector<vector<Rpp8u>> nchw_imgs_rgb;
+    convert_nhwc_to_nchw(imgs_rgb, nchw_imgs_rgb);
+    cout << "RGB NCHW conversion complete\n" << endl;
+
+    cout << "Converting Grayscale to NCHW format..." << endl;
+    vector<vector<Rpp8u>> nchw_imgs_gray;
+    nchw_imgs_gray.resize(imgs_gray.size());
+    for (size_t i = 0; i < imgs_gray.size(); i++) {
+        int w = imgs_gray[i].cols;
+        int h = imgs_gray[i].rows;
+        nchw_imgs_gray[i].resize(w * h);
+        memcpy(nchw_imgs_gray[i].data(), imgs_gray[i].data, w * h);
+    }
+    cout << "Grayscale NCHW conversion complete\n" << endl;
+
     vector<pair<int, int>> cropSizes = {
-        {224, 224},  // Common CNN input size
-        {512, 512},  // Medium crop
-        {1024, 1024} // Large crop
+        {224, 224},
+        {512, 512},
+        {1024, 1024}
     };
 
     for (const auto& cropSize : cropSizes) {
         int cropW = min(cropSize.first, maxWidth);
         int cropH = min(cropSize.second, maxHeight);
         
-        if (cropW < 64 || cropH < 64) continue; 
+        if (cropW < 64 || cropH < 64) continue;
         
-        cout << "---------------------------------------------------------------" << endl;
-        cout << "  Crop Size: " << cropW << "x" << cropH << " | Batch: " << batchSize << " images" << endl;
-        cout << "---------------------------------------------------------------" << endl;
+        cout << "===============================================================" << endl;
+        cout << "  Crop: " << cropW << "x" << cropH << " (" << (cropW*cropH)/1000.0 << "K px)  |  Batch: " << batchSize << " images" << endl;
+        cout << "===============================================================" << endl;
         
-        benchmarkOpenCV_Crop(imgs, cropW, cropH);
-        benchmarkRPP_Crop_NHWC(imgs, cropW, cropH);
-        benchmarkRPP_Crop_NCHW(nchw_imgs, imgs, cropW, cropH);
+        cout << "\n--- RGB (3-channel) Benchmarks ---" << endl;
+        benchmarkOpenCV_Crop_RGB(imgs_rgb, cropW, cropH);
+        benchmarkRPP_Crop_NHWC(imgs_rgb, cropW, cropH);
+        benchmarkRPP_Crop_NCHW(nchw_imgs_rgb, imgs_rgb, cropW, cropH);
+        
+        cout << "\n--- Grayscale (1-channel) Benchmarks ---" << endl;
+        benchmarkOpenCV_Crop_Grayscale(imgs_gray, cropW, cropH);
+        benchmarkRPP_Crop_Grayscale(nchw_imgs_gray, imgs_gray, cropW, cropH);
         
         cout << endl;
     }
 
     cout << "===============================================================" << endl;
     cout << "  Benchmark Complete!" << endl;
+    cout << "  Note: Only images >= crop size were benchmarked" << endl;
     cout << "===============================================================\n" << endl;
 
     return 0;
