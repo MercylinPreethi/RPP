@@ -44,7 +44,6 @@ typedef RpptDesc* RpptDescPtr;
 
 struct RppLayoutParams { Rpp32u bufferMultiplier; Rpp32u channelParam; };
 
-
 inline void rpp_load48_u8pkd3_to_u8pln3(Rpp8u *srcPtr, __m128i *px)
 {
     __m128i pxSrc[8];
@@ -216,16 +215,37 @@ void convert_to_grayscale(const vector<Mat>& rgb_imgs, vector<Mat>& gray_imgs)
 }
 
 
+struct ImageCropInfo {
+    Rpp8u* srcPtr;
+    int srcRowStep;
+    int roiX;
+    int roiY;
+    bool isValid;
+};
+
 void benchmarkOpenCV_Crop_RGB(const vector<Mat>& imgs, int cropW, int cropH)
 {
     int batchSize = imgs.size();
     if (batchSize == 0) return;
 
-    // Count valid images
+    vector<ImageCropInfo> cropInfo(batchSize);
     int validCount = 0;
+    
+    int channels = 3; 
+    size_t pixelsPerCrop = (size_t)cropW * cropH * channels;
+    vector<Rpp8u> flatOutput(batchSize * pixelsPerCrop);
+
     for (int i = 0; i < batchSize; i++) {
+        cropInfo[i].srcPtr = imgs[i].data;
+        cropInfo[i].srcRowStep = imgs[i].step[0];
+        
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
+            cropInfo[i].roiX = (imgs[i].cols - cropW) / 2;
+            cropInfo[i].roiY = (imgs[i].rows - cropH) / 2;
+            cropInfo[i].isValid = true;
             validCount++;
+        } else {
+            cropInfo[i].isValid = false;
         }
     }
     
@@ -234,37 +254,37 @@ void benchmarkOpenCV_Crop_RGB(const vector<Mat>& imgs, int cropW, int cropH)
         return;
     }
 
-    vector<Mat> output(batchSize);
-    vector<Rect> rois(batchSize);
-    vector<bool> isValid(batchSize);
-    
-    auto start = high_resolution_clock::now();
-
-    for (int i = 0; i < batchSize; i++) {
-        if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
-            int x = (imgs[i].cols - cropW) / 2;
-            int y = (imgs[i].rows - cropH) / 2;
-            rois[i] = Rect(x, y, cropW, cropH);
-            isValid[i] = true;
-        } else {
-            isValid[i] = false;
-        }
-    }
+    microseconds total_duration(0);
+    int total_valid_ops = 0;
 
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
-            if (isValid[i]) {
-                output[i] = imgs[i](rois[i]).clone();
+            const ImageCropInfo& info = cropInfo[i];  // Single struct access
+            
+            if (info.isValid) {
+                int bytesToCopyPerRow = cropW * channels;
+                Rpp8u* src = info.srcPtr + (info.roiY * info.srcRowStep) + (info.roiX * channels);
+                Rpp8u* dst = flatOutput.data() + (i * pixelsPerCrop);
+
+                auto start = high_resolution_clock::now();
+
+                for (int r = 0; r < cropH; r++) {
+                    memcpy(dst + (r * bytesToCopyPerRow), 
+                           src + (r * info.srcRowStep), 
+                           bytesToCopyPerRow);
+                }
+
+                auto end = high_resolution_clock::now();
+
+                total_duration += duration_cast<microseconds>(end - start);
+                total_valid_ops++;
             }
         }
     }
 
-    auto end = high_resolution_clock::now();
-
-    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
-    double avg_time = total_time_ms / NUM_ITERATIONS;
+    double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_ops;
     
-    cout << "OpenCV RGB (3-ch)    : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+    cout << "OpenCV RGB (3-ch)    : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
 }
 
@@ -273,11 +293,32 @@ void benchmarkOpenCV_Crop_Grayscale(const vector<Mat>& gray_imgs, int cropW, int
     int batchSize = gray_imgs.size();
     if (batchSize == 0) return;
 
-
+    struct GrayCropInfo {
+        Rpp8u* srcPtr;
+        int srcCols;
+        int roiX;
+        int roiY;
+        bool isValid;
+    };
+    
+    vector<GrayCropInfo> cropInfo(batchSize);
     int validCount = 0;
+    
+    int channels = 1; 
+    vector<Rpp8u> flatOutput(batchSize * cropW * cropH);
+
+    // Initialize everything in one pass
     for (int i = 0; i < batchSize; i++) {
+        cropInfo[i].srcPtr = gray_imgs[i].data;
+        cropInfo[i].srcCols = gray_imgs[i].cols;
+        
         if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
+            cropInfo[i].roiX = (gray_imgs[i].cols - cropW) / 2;
+            cropInfo[i].roiY = (gray_imgs[i].rows - cropH) / 2;
+            cropInfo[i].isValid = true;
             validCount++;
+        } else {
+            cropInfo[i].isValid = false;
         }
     }
     
@@ -286,37 +327,34 @@ void benchmarkOpenCV_Crop_Grayscale(const vector<Mat>& gray_imgs, int cropW, int
         return;
     }
 
-    vector<Mat> output(batchSize);
-    vector<Rect> rois(batchSize);
-    vector<bool> isValid(batchSize);
-
-    auto start = high_resolution_clock::now();
-    
-    for (int i = 0; i < batchSize; i++) {
-        if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
-            int x = (gray_imgs[i].cols - cropW) / 2;
-            int y = (gray_imgs[i].rows - cropH) / 2;
-            rois[i] = Rect(x, y, cropW, cropH);
-            isValid[i] = true;
-        } else {
-            isValid[i] = false;
-        }
-    }
+    microseconds total_duration(0);
+    int total_valid_calls = 0;
 
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
-            if (isValid[i]) {
-                output[i] = gray_imgs[i](rois[i]).clone();
+            const GrayCropInfo& info = cropInfo[i];  // Single struct access
+            
+            if (info.isValid) {
+                Rpp8u* src = info.srcPtr + (info.roiY * info.srcCols) + info.roiX;
+                Rpp8u* dst = flatOutput.data() + (i * cropW * cropH);
+
+                auto start = high_resolution_clock::now();
+
+                for (int r = 0; r < cropH; r++) {
+                    memcpy(dst + (r * cropW), src + (r * info.srcCols), cropW);
+                }
+
+                auto end = high_resolution_clock::now();
+
+                total_duration += duration_cast<microseconds>(end - start);
+                total_valid_calls++;
             }
         }
     }
 
-    auto end = high_resolution_clock::now();
+    double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_calls;
 
-    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
-    double avg_time = total_time_ms / NUM_ITERATIONS;
-    
-    cout << "OpenCV Gray (1-ch)   : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+    cout << "OpenCV Gray (1-ch)   : " << fixed << setprecision(3) << setw(8) << avg_time_ms  << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
 }
 
@@ -348,8 +386,6 @@ void benchmarkRPP_Crop_NHWC(const vector<Mat>& imgs, int cropW, int cropH)
     vector<RpptROI> rois(batchSize);
     vector<bool> isValid(batchSize);
     
-    auto start = high_resolution_clock::now();
-
     for (int i = 0; i < batchSize; i++) {
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
             const Mat& img = imgs[i];
@@ -383,22 +419,30 @@ void benchmarkRPP_Crop_NHWC(const vector<Mat>& imgs, int cropW, int cropH)
 
     RppLayoutParams layoutParams = {3, 1};
 
+    microseconds total_duration(0);
+    int total_valid_ops = 0;
+
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
             if (isValid[i]) {
+
+                auto start = high_resolution_clock::now();
+
                 crop_u8_u8_host(imgs[i].data, &srcDescs[i], output[i].data(), &dstDescs[i],
-                               &rois[i], RpptRoiType::XYWH, layoutParams);
+                                &rois[i], RpptRoiType::XYWH, layoutParams);
+
+                auto end = high_resolution_clock::now();
+                total_duration += duration_cast<microseconds>(end - start);
+                total_valid_ops++;
             }
         }
     }
 
-    auto end = high_resolution_clock::now();
-
-    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
-    double avg_time = total_time_ms / NUM_ITERATIONS;
+    double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_ops;
     
-    cout << "RPP NHWC (3-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+    cout << "RPP NHWC (3-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
+
 }
 
 void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector<Mat>& imgs, int cropW, int cropH)
@@ -429,8 +473,6 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
     vector<RpptROI> rois(batchSize);
     vector<bool> isValid(batchSize);
 
-    auto start = high_resolution_clock::now();
-    
     for (int i = 0; i < batchSize; i++) {
         if (imgs[i].cols >= cropW && imgs[i].rows >= cropH) {
             const Mat& img = imgs[i];
@@ -464,27 +506,35 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
 
     RppLayoutParams layoutParams = {1, 1};
 
+    microseconds total_duration(0);
+    int total_valid_ops = 0;
 
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
             if (isValid[i]) {
+                
                 for (int c = 0; c < channels; c++) {
+
                     Rpp8u* srcChannel = (Rpp8u*)nchw_imgs[i].data() + c * srcDescs[i].strides.cStride;
                     Rpp8u* dstChannel = output[i].data() + c * dstDescs[i].strides.cStride;
+
+                    auto start = high_resolution_clock::now();    
                     
                     crop_u8_u8_host(srcChannel, &srcDescs[i], dstChannel, &dstDescs[i],
                                    &rois[i], RpptRoiType::XYWH, layoutParams);
+                    
+                    auto end = high_resolution_clock::now();
+
+                    total_duration += duration_cast<microseconds>(end - start);
+                    total_valid_ops++;
                 }
             }
         }
     }
 
-    auto end = high_resolution_clock::now();
-
-    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
-    double avg_time = total_time_ms / NUM_ITERATIONS;
+    double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_ops;
     
-    cout << "RPP NCHW (1-ch×3)    : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+    cout << "RPP NCHW (1-ch×3)    : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
 }
 
@@ -518,8 +568,6 @@ void benchmarkRPP_Crop_Grayscale(const vector<vector<Rpp8u>>& gray_nchw_imgs,
     vector<RpptROI> rois(batchSize);
     vector<bool> isValid(batchSize);
 
-    auto start = high_resolution_clock::now();
-    
     for (int i = 0; i < batchSize; i++) {
         if (gray_imgs[i].cols >= cropW && gray_imgs[i].rows >= cropH) {
             const Mat& img = gray_imgs[i];
@@ -553,22 +601,28 @@ void benchmarkRPP_Crop_Grayscale(const vector<vector<Rpp8u>>& gray_nchw_imgs,
 
     RppLayoutParams layoutParams = {1, 1};
 
+    microseconds total_duration(0);
+    int total_valid_ops = 0;
+
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
             if (isValid[i]) {
+                auto start = high_resolution_clock::now();
+                
                 crop_u8_u8_host((Rpp8u*)gray_nchw_imgs[i].data(), &srcDescs[i], 
                                output[i].data(), &dstDescs[i],
                                &rois[i], RpptRoiType::XYWH, layoutParams);
+                
+                auto end = high_resolution_clock::now();
+                total_duration += duration_cast<microseconds>(end - start);
+                total_valid_ops++;
             }
         }
     }
 
-    auto end = high_resolution_clock::now();
-
-    double total_time_ms = duration_cast<microseconds>(end - start).count() / 1000.0;
-    double avg_time = total_time_ms / NUM_ITERATIONS;
+    double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_ops;
     
-    cout << "RPP Gray (1-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time << " ms  |  " 
+    cout << "RPP Gray (1-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
 }
 
