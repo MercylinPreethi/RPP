@@ -20,6 +20,9 @@ using namespace cv;
 using namespace chrono;
 
 typedef unsigned char Rpp8u;
+typedef signed char Rpp8s;
+typedef float Rpp32f;
+typedef unsigned short Rpp16f;
 typedef int Rpp32s;
 typedef unsigned int Rpp32u;
 
@@ -43,6 +46,46 @@ struct RpptDesc { Rpp32u n; Rpp32u c; Rpp32u h; Rpp32u w; RpptLayout layout; Rpp
 typedef RpptDesc* RpptDescPtr;
 
 struct RppLayoutParams { Rpp32u bufferMultiplier; Rpp32u channelParam; };
+
+// Global SIMD constants
+static const __m128i xmm_pxConvertI8 = _mm_set1_epi8((char)128);
+
+
+inline void compute_xywh_from_ltrb_host(RpptROIPtr roiPtrInput, RpptROIPtr roiPtrImage)
+{
+    roiPtrImage->xywhROI.xy.x = roiPtrInput->ltrbROI.lt.x;
+    roiPtrImage->xywhROI.xy.y = roiPtrInput->ltrbROI.lt.y;
+    roiPtrImage->xywhROI.roiWidth = roiPtrInput->ltrbROI.rb.x - roiPtrInput->ltrbROI.lt.x + 1;
+    roiPtrImage->xywhROI.roiHeight = roiPtrInput->ltrbROI.rb.y - roiPtrInput->ltrbROI.lt.y + 1;
+}
+
+
+inline void compute_roi_boundary_check_host(RpptROIPtr roiPtrImage, RpptROIPtr roiPtr, RpptROIPtr roiPtrDefault)
+{
+    roiPtr->xywhROI.xy.x = std::max(roiPtrDefault->xywhROI.xy.x, roiPtrImage->xywhROI.xy.x);
+    roiPtr->xywhROI.xy.y = std::max(roiPtrDefault->xywhROI.xy.y, roiPtrImage->xywhROI.xy.y);
+    roiPtr->xywhROI.roiWidth = std::min(roiPtrDefault->xywhROI.roiWidth - roiPtrImage->xywhROI.xy.x, roiPtrImage->xywhROI.roiWidth);
+    roiPtr->xywhROI.roiHeight = std::min(roiPtrDefault->xywhROI.roiHeight - roiPtrImage->xywhROI.xy.y, roiPtrImage->xywhROI.roiHeight);
+}
+
+inline void compute_roi_validation_host(RpptROIPtr roiPtrInput, RpptROIPtr roiPtr, RpptROIPtr roiPtrDefault, RpptRoiType roiType)
+{
+    if (roiPtrInput == NULL)
+    {
+        roiPtr = roiPtrDefault;
+    }
+    else
+    {
+        RpptROI roiImage;
+        RpptROIPtr roiPtrImage = &roiImage;
+        if (roiType == RpptRoiType::LTRB)
+            compute_xywh_from_ltrb_host(roiPtrInput, roiPtrImage);
+        else if (roiType == RpptRoiType::XYWH)
+            roiPtrImage = roiPtrInput;
+        compute_roi_boundary_check_host(roiPtrImage, roiPtr, roiPtrDefault);
+    }
+}
+
 
 inline void rpp_load48_u8pkd3_to_u8pln3(Rpp8u *srcPtr, __m128i *px)
 {
@@ -96,46 +139,142 @@ inline void rpp_store48_u8pln3_to_u8pkd3(Rpp8u *dstPtr, __m128i *px)
     _mm_storeu_si128((__m128i *)(dstPtr + 36), _mm_shuffle_epi8(_mm_unpackhi_epi8(pxDst[3], pxDst[1]), pxMaskRGBAtoRGB));
 }
 
-
-inline void compute_roi_validation_host(RpptROIPtr roiPtr, int srcW, int srcH)
+RppStatus crop_u8_u8_host(Rpp8u *srcPtr,
+                                     RpptDescPtr srcDescPtr,
+                                     Rpp8u *dstPtr,
+                                     RpptDescPtr dstDescPtr,
+                                     RpptROIPtr roiPtr,
+                                     RpptRoiType roiType,
+                                     RppLayoutParams layoutParams)
 {
-    roiPtr->xywhROI.xy.x = max(0, min(roiPtr->xywhROI.xy.x, srcW - 1));
-    roiPtr->xywhROI.xy.y = max(0, min(roiPtr->xywhROI.xy.y, srcH - 1));
-    roiPtr->xywhROI.roiWidth = min(roiPtr->xywhROI.roiWidth, srcW - roiPtr->xywhROI.xy.x);
-    roiPtr->xywhROI.roiHeight = min(roiPtr->xywhROI.roiHeight, srcH - roiPtr->xywhROI.xy.y);
-}
+    RpptROI roiDefault = {0, 0, (Rpp32s)srcDescPtr->w, (Rpp32s)srcDescPtr->h};
 
-
-
-RppStatus crop_u8_u8_host(Rpp8u *srcPtr, RpptDescPtr srcDescPtr, Rpp8u *dstPtr, RpptDescPtr dstDescPtr,
-                          RpptROIPtr roiPtr, RpptRoiType roiType, RppLayoutParams layoutParams)
-{
-    RpptROI roi = *roiPtr;
-    compute_roi_validation_host(&roi, srcDescPtr->w, srcDescPtr->h);
+    RpptROI roi;
+    compute_roi_validation_host(roiPtr, &roi, &roiDefault, roiType);
 
     Rpp8u *srcPtrImage = srcPtr;
     Rpp8u *dstPtrImage = dstPtr;
+
     Rpp32u bufferLength = roi.xywhROI.roiWidth * layoutParams.bufferMultiplier;
 
     Rpp8u *srcPtrChannel, *dstPtrChannel;
     srcPtrChannel = srcPtrImage + (roi.xywhROI.xy.y * srcDescPtr->strides.hStride) + (roi.xywhROI.xy.x * layoutParams.bufferMultiplier);
     dstPtrChannel = dstPtrImage;
 
-    for(int c = 0; c < layoutParams.channelParam; c++)
+    // Crop with fused output-layout toggle (NHWC -> NCHW)
+    if ((srcDescPtr->c == 3) && (srcDescPtr->layout == RpptLayout::NHWC) && (dstDescPtr->layout == RpptLayout::NCHW))
     {
-        Rpp8u *srcPtrRow, *dstPtrRow;
+        Rpp32u alignedLength = (bufferLength / 48) * 48;
+
+        Rpp8u *srcPtrRow, *dstPtrRowR, *dstPtrRowG, *dstPtrRowB;
         srcPtrRow = srcPtrChannel;
+        dstPtrRowR = dstPtrChannel;
+        dstPtrRowG = dstPtrRowR + dstDescPtr->strides.cStride;
+        dstPtrRowB = dstPtrRowG + dstDescPtr->strides.cStride;
+
+        for(int i = 0; i < roi.xywhROI.roiHeight; i++)
+        {
+            Rpp8u *srcPtrTemp, *dstPtrTempR, *dstPtrTempG, *dstPtrTempB;
+            srcPtrTemp = srcPtrRow;
+            dstPtrTempR = dstPtrRowR;
+            dstPtrTempG = dstPtrRowG;
+            dstPtrTempB = dstPtrRowB;
+
+            int vectorLoopCount = 0;
+            for (; vectorLoopCount < alignedLength; vectorLoopCount+=48)
+            {
+                __m128i px[3];
+                rpp_load48_u8pkd3_to_u8pln3(srcPtrTemp, px);
+                rpp_store48_u8pln3_to_u8pln3(dstPtrTempR, dstPtrTempG, dstPtrTempB, px);
+                srcPtrTemp += 48;
+                dstPtrTempR += 16;
+                dstPtrTempG += 16;
+                dstPtrTempB += 16;
+            }
+            for (; vectorLoopCount < bufferLength; vectorLoopCount+=3)
+            {
+                *dstPtrTempR = srcPtrTemp[0];
+                *dstPtrTempG = srcPtrTemp[1];
+                *dstPtrTempB = srcPtrTemp[2];
+                srcPtrTemp += 3;
+                dstPtrTempR++;
+                dstPtrTempG++;
+                dstPtrTempB++;
+            }
+
+            srcPtrRow += srcDescPtr->strides.hStride;
+            dstPtrRowR += dstDescPtr->strides.hStride;
+            dstPtrRowG += dstDescPtr->strides.hStride;
+            dstPtrRowB += dstDescPtr->strides.hStride;
+        }
+    }
+
+    // Crop with fused output-layout toggle (NCHW -> NHWC)
+    else if ((srcDescPtr->c == 3) && (srcDescPtr->layout == RpptLayout::NCHW) && (dstDescPtr->layout == RpptLayout::NHWC))
+    {
+        Rpp32u alignedLength = (bufferLength / 48) * 48;
+
+        Rpp8u *srcPtrRowR, *srcPtrRowG, *srcPtrRowB, *dstPtrRow;
+        srcPtrRowR = srcPtrChannel;
+        srcPtrRowG = srcPtrRowR + srcDescPtr->strides.cStride;
+        srcPtrRowB = srcPtrRowG + srcDescPtr->strides.cStride;
         dstPtrRow = dstPtrChannel;
 
         for(int i = 0; i < roi.xywhROI.roiHeight; i++)
         {
-            memcpy(dstPtrRow, srcPtrRow, bufferLength);
-            srcPtrRow += srcDescPtr->strides.hStride;
+            Rpp8u *srcPtrTempR, *srcPtrTempG, *srcPtrTempB, *dstPtrTemp;
+            srcPtrTempR = srcPtrRowR;
+            srcPtrTempG = srcPtrRowG;
+            srcPtrTempB = srcPtrRowB;
+            dstPtrTemp = dstPtrRow;
+
+            int vectorLoopCount = 0;
+            for (; vectorLoopCount < alignedLength; vectorLoopCount+=16)
+            {
+                __m128i px[3];
+                rpp_load48_u8pln3_to_u8pln3(srcPtrTempR, srcPtrTempG, srcPtrTempB, px);
+                rpp_store48_u8pln3_to_u8pkd3(dstPtrTemp, px);
+                srcPtrTempR += 16;
+                srcPtrTempG += 16;
+                srcPtrTempB += 16;
+                dstPtrTemp += 48;
+            }
+            for (; vectorLoopCount < bufferLength; vectorLoopCount++)
+            {
+                dstPtrTemp[0] = *srcPtrTempR;
+                dstPtrTemp[1] = *srcPtrTempG;
+                dstPtrTemp[2] = *srcPtrTempB;
+                srcPtrTempR++;
+                srcPtrTempG++;
+                srcPtrTempB++;
+                dstPtrTemp += 3;
+            }
+
+            srcPtrRowR += srcDescPtr->strides.hStride;
+            srcPtrRowG += srcDescPtr->strides.hStride;
+            srcPtrRowB += srcDescPtr->strides.hStride;
             dstPtrRow += dstDescPtr->strides.hStride;
         }
+    }
 
-        srcPtrChannel += srcDescPtr->strides.cStride;
-        dstPtrChannel += dstDescPtr->strides.cStride;
+    else
+    {
+        for(int c = 0; c < layoutParams.channelParam; c++)
+        {
+            Rpp8u *srcPtrRow, *dstPtrRow;
+            srcPtrRow = srcPtrChannel;
+            dstPtrRow = dstPtrChannel;
+
+            for(int i = 0; i < roi.xywhROI.roiHeight; i++)
+            {
+                memcpy(dstPtrRow, srcPtrRow, bufferLength);
+                srcPtrRow += srcDescPtr->strides.hStride;
+                dstPtrRow += dstDescPtr->strides.hStride;
+            }
+
+            srcPtrChannel += srcDescPtr->strides.cStride;
+            dstPtrChannel += dstDescPtr->strides.cStride;
+        }
     }
 
     return RPP_SUCCESS;
@@ -254,6 +393,26 @@ void benchmarkOpenCV_Crop_RGB(const vector<Mat>& imgs, int cropW, int cropH)
         return;
     }
 
+    // Warmup phase - run 10 iterations to populate caches
+    const int WARMUP_ITERATIONS = 10;
+    for (int k = 0; k < WARMUP_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            const ImageCropInfo& info = cropInfo[i];
+            
+            if (info.isValid) {
+                int bytesToCopyPerRow = cropW * channels;
+                Rpp8u* src = info.srcPtr + (info.roiY * info.srcRowStep) + (info.roiX * channels);
+                Rpp8u* dst = flatOutput.data() + (i * pixelsPerCrop);
+
+                for (int r = 0; r < cropH; r++) {
+                    memcpy(dst + (r * bytesToCopyPerRow), 
+                           src + (r * info.srcRowStep), 
+                           bytesToCopyPerRow);
+                }
+            }
+        }
+    }
+
     microseconds total_duration(0);
     int total_valid_ops = 0;
 
@@ -325,6 +484,23 @@ void benchmarkOpenCV_Crop_Grayscale(const vector<Mat>& gray_imgs, int cropW, int
     if (validCount == 0) {
         cout << "OpenCV Gray (1-ch)   : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
         return;
+    }
+
+    // Warmup phase
+    const int WARMUP_ITERATIONS = 10;
+    for (int k = 0; k < WARMUP_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            const GrayCropInfo& info = cropInfo[i];
+            
+            if (info.isValid) {
+                Rpp8u* src = info.srcPtr + (info.roiY * info.srcCols) + info.roiX;
+                Rpp8u* dst = flatOutput.data() + (i * cropW * cropH);
+
+                for (int r = 0; r < cropH; r++) {
+                    memcpy(dst + (r * cropW), src + (r * info.srcCols), cropW);
+                }
+            }
+        }
     }
 
     microseconds total_duration(0);
@@ -419,6 +595,17 @@ void benchmarkRPP_Crop_NHWC(const vector<Mat>& imgs, int cropW, int cropH)
 
     RppLayoutParams layoutParams = {3, 1};
 
+    // Warmup phase
+    const int WARMUP_ITERATIONS = 10;
+    for (int k = 0; k < WARMUP_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                crop_u8_u8_host(imgs[i].data, &srcDescs[i], output[i].data(), &dstDescs[i],
+                                &rois[i], RpptRoiType::XYWH, layoutParams);
+            }
+        }
+    }
+
     microseconds total_duration(0);
     int total_valid_ops = 0;
 
@@ -445,7 +632,7 @@ void benchmarkRPP_Crop_NHWC(const vector<Mat>& imgs, int cropW, int cropH)
 
 }
 
-void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector<Mat>& imgs, int cropW, int cropH)
+void benchmarkRPP_Crop_NCHW(const vector<Mat>& imgs, int cropW, int cropH)
 {
     int batchSize = imgs.size();
     if (batchSize == 0) return;
@@ -458,7 +645,7 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
     }
     
     if (validCount == 0) {
-        cout << "RPP NCHW (1-ch×3)    : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
+        cout << "RPP NCHW (3-ch)      : SKIPPED (no images >= " << cropW << "x" << cropH << ")" << endl;
         return;
     }
 
@@ -482,6 +669,7 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
             rois[i].xywhROI.roiWidth = cropW;
             rois[i].xywhROI.roiHeight = cropH;
             
+            // Source is NCHW (treating RGB as NCHW for testing)
             srcDescs[i].h = img.rows;
             srcDescs[i].w = img.cols;
             srcDescs[i].c = channels;
@@ -490,6 +678,7 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
             srcDescs[i].strides.wStride = 1;
             srcDescs[i].strides.cStride = img.cols * img.rows;
             
+            // Destination is NCHW
             dstDescs[i].h = cropH;
             dstDescs[i].w = cropW;
             dstDescs[i].c = channels;
@@ -504,7 +693,19 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
         }
     }
 
-    RppLayoutParams layoutParams = {1, 1};
+    RppLayoutParams layoutParams = {1, 3};  // NCHW: bufferMultiplier=1, channelParam=3
+
+    // Warmup phase
+    const int WARMUP_ITERATIONS = 10;
+    for (int k = 0; k < WARMUP_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                crop_u8_u8_host(imgs[i].data, &srcDescs[i], 
+                               output[i].data(), &dstDescs[i],
+                               &rois[i], RpptRoiType::XYWH, layoutParams);
+            }
+        }
+    }
 
     microseconds total_duration(0);
     int total_valid_ops = 0;
@@ -512,29 +713,23 @@ void benchmarkRPP_Crop_NCHW(const vector<vector<Rpp8u>>& nchw_imgs, const vector
     for (int k = 0; k < NUM_ITERATIONS; k++) {
         for (int i = 0; i < batchSize; i++) {
             if (isValid[i]) {
+                auto start = high_resolution_clock::now();   
                 
-                for (int c = 0; c < channels; c++) {
+                crop_u8_u8_host(imgs[i].data, &srcDescs[i], 
+                               output[i].data(), &dstDescs[i],
+                               &rois[i], RpptRoiType::XYWH, layoutParams);
+                
+                auto end = high_resolution_clock::now();
 
-                    Rpp8u* srcChannel = (Rpp8u*)nchw_imgs[i].data() + c * srcDescs[i].strides.cStride;
-                    Rpp8u* dstChannel = output[i].data() + c * dstDescs[i].strides.cStride;
-
-                    auto start = high_resolution_clock::now();    
-                    
-                    crop_u8_u8_host(srcChannel, &srcDescs[i], dstChannel, &dstDescs[i],
-                                   &rois[i], RpptRoiType::XYWH, layoutParams);
-                    
-                    auto end = high_resolution_clock::now();
-
-                    total_duration += duration_cast<microseconds>(end - start);
-                    total_valid_ops++;
-                }
+                total_duration += duration_cast<microseconds>(end - start);
+                total_valid_ops++;
             }
         }
     }
 
     double avg_time_ms = (total_duration.count() / 1000.0) / total_valid_ops;
     
-    cout << "RPP NCHW (1-ch×3)    : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
+    cout << "RPP NCHW (3-ch)      : " << fixed << setprecision(3) << setw(8) << avg_time_ms << " ms  |  " 
          << setw(8) << setprecision(1) << endl;
 }
 
@@ -601,6 +796,18 @@ void benchmarkRPP_Crop_Grayscale(const vector<vector<Rpp8u>>& gray_nchw_imgs,
 
     RppLayoutParams layoutParams = {1, 1};
 
+    // Warmup phase
+    const int WARMUP_ITERATIONS = 10;
+    for (int k = 0; k < WARMUP_ITERATIONS; k++) {
+        for (int i = 0; i < batchSize; i++) {
+            if (isValid[i]) {
+                crop_u8_u8_host((Rpp8u*)gray_nchw_imgs[i].data(), &srcDescs[i], 
+                               output[i].data(), &dstDescs[i],
+                               &rois[i], RpptRoiType::XYWH, layoutParams);
+            }
+        }
+    }
+
     microseconds total_duration(0);
     int total_valid_ops = 0;
 
@@ -633,6 +840,7 @@ int main(int argc, char** argv) {
     cout << "\n===============================================================" << endl;
     cout << "  Crop Performance Benchmark: OpenCV vs RPP" << endl;
     cout << "  Size-Safe Benchmarking (skips images that are too small)" << endl;
+    cout << "  Warmup: 10 iterations | Benchmark: 100 iterations" << endl;
     cout << "===============================================================\n" << endl;
 
     int batchSize = 0, maxWidth = 0, maxHeight = 0;
@@ -652,12 +860,6 @@ int main(int argc, char** argv) {
     vector<Mat> imgs_gray;
     convert_to_grayscale(imgs_rgb, imgs_gray);
     cout << "Grayscale conversion complete\n" << endl;
-
-    cout << "Converting RGB to NCHW format..." << endl;
-
-    vector<vector<Rpp8u>> nchw_imgs_rgb;
-    convert_nhwc_to_nchw(imgs_rgb, nchw_imgs_rgb);
-    cout << "RGB NCHW conversion complete\n" << endl;
 
     cout << "Converting Grayscale to NCHW format..." << endl;
     vector<vector<Rpp8u>> nchw_imgs_gray;
@@ -689,7 +891,7 @@ int main(int argc, char** argv) {
         cout << "\n--- RGB (3-channel) Benchmarks ---" << endl;
         benchmarkOpenCV_Crop_RGB(imgs_rgb, cropW, cropH);
         benchmarkRPP_Crop_NHWC(imgs_rgb, cropW, cropH);
-        benchmarkRPP_Crop_NCHW(nchw_imgs_rgb, imgs_rgb, cropW, cropH);
+        benchmarkRPP_Crop_NCHW(imgs_rgb, cropW, cropH);
         
         cout << "\n--- Grayscale (1-channel) Benchmarks ---" << endl;
         benchmarkOpenCV_Crop_Grayscale(imgs_gray, cropW, cropH);
